@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Three Particles</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { overflow: hidden; background: #000; }
+    canvas { display: block; }
+  </style>
+</head>
+<body>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module">
+import * as THREE from 'three';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ──────────── Config ────────────
+const PARTICLE_COUNT = 18000;
+const PARTICLE_COLOR = new THREE.Color(0.85, 0.55, 0.95); // soft violet
+const MIN_SIZE = 0.006;
+const MAX_SIZE = 0.025;
+const NOISE_SPEED = 0.3;
+const NOISE_AMPLITUDE = 0.012;
+
+// ──────────── Scene setup ────────────
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000000);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 0, 3);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.enablePan = false;
+
+// ──────────── Simple 3D noise (hash-based) ────────────
+function hash(p) {
+  let h = (Math.sin(p.x * 127.1 + p.y * 311.7 + p.z * 74.7) * 43758.5453);
+  return h - Math.floor(h);
+}
+
+function noise3D(x, y, z, t) {
+  const sx = Math.sin(x * 1.7 + t) * Math.cos(z * 2.3 + t * 0.7);
+  const sy = Math.sin(y * 2.1 + t * 0.8) * Math.cos(x * 1.9 + t * 0.5);
+  const sz = Math.sin(z * 1.5 + t * 1.1) * Math.cos(y * 2.7 + t * 0.3);
+  return { x: sx, y: sy, z: sz };
+}
+
+// ──────────── Sample points on mesh surface ────────────
+function sampleSurfacePoints(geometry, count) {
+  const pos = geometry.attributes.position;
+  const idx = geometry.index;
+
+  // Build triangle list
+  const triangles = [];
+  const triCount = idx ? idx.count / 3 : pos.count / 3;
+
+  const vA = new THREE.Vector3(), vB = new THREE.Vector3(), vC = new THREE.Vector3();
+  const areas = [];
+  let totalArea = 0;
+
+  for (let i = 0; i < triCount; i++) {
+    const a = idx ? idx.getX(i * 3) : i * 3;
+    const b = idx ? idx.getX(i * 3 + 1) : i * 3 + 1;
+    const c = idx ? idx.getX(i * 3 + 2) : i * 3 + 2;
+
+    vA.fromBufferAttribute(pos, a);
+    vB.fromBufferAttribute(pos, b);
+    vC.fromBufferAttribute(pos, c);
+
+    const area = new THREE.Triangle(vA.clone(), vB.clone(), vC.clone()).getArea();
+    areas.push(area);
+    totalArea += area;
+    triangles.push([vA.clone(), vB.clone(), vC.clone()]);
+  }
+
+  // Build CDF for weighted random sampling
+  const cdf = [];
+  let cumulative = 0;
+  for (let i = 0; i < areas.length; i++) {
+    cumulative += areas[i] / totalArea;
+    cdf.push(cumulative);
+  }
+
+  // Sample points
+  const points = [];
+  const normals = [];
+  for (let i = 0; i < count; i++) {
+    const r = Math.random();
+    let ti = 0;
+    for (let j = 0; j < cdf.length; j++) {
+      if (r <= cdf[j]) { ti = j; break; }
+    }
+
+    const [a, b, c] = triangles[ti];
+    let u = Math.random();
+    let v = Math.random();
+    if (u + v > 1) { u = 1 - u; v = 1 - v; }
+    const w = 1 - u - v;
+
+    const point = new THREE.Vector3(
+      a.x * w + b.x * u + c.x * v,
+      a.y * w + b.y * u + c.y * v,
+      a.z * w + b.z * u + c.z * v,
+    );
+
+    // Compute face normal for tangent movement
+    const edge1 = new THREE.Vector3().subVectors(b, a);
+    const edge2 = new THREE.Vector3().subVectors(c, a);
+    const normal = new THREE.Vector3().crossVectors(edge1, edge2).normalize();
+
+    points.push(point);
+    normals.push(normal);
+  }
+
+  return { points, normals };
+}
+
+// ──────────── Create circular particle texture ────────────
+function createParticleTexture() {
+  const size = 128;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+
+  const center = size / 2;
+  const radius = size / 2;
+
+  // Solid opaque circle with soft edge
+  const gradient = ctx.createRadialGradient(center, center, 0, center, center, radius);
+  gradient.addColorStop(0, 'rgba(255,255,255,1)');
+  gradient.addColorStop(0.7, 'rgba(255,255,255,1)');
+  gradient.addColorStop(1, 'rgba(255,255,255,0)');
+
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, size, size);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.needsUpdate = true;
+  return texture;
+}
+
+// ──────────── Load model & build particles ────────────
+const loader = new OBJLoader();
+loader.load('assets/face.OBJ', (obj) => {
+  // Merge all geometries
+  let mergedGeometry = null;
+  obj.traverse((child) => {
+    if (child.isMesh) {
+      const geo = child.geometry.clone();
+      geo.applyMatrix4(child.matrixWorld);
+      if (!mergedGeometry) {
+        mergedGeometry = geo;
+      } else {
+        // Simple: just use the first mesh
+      }
+    }
+  });
+
+  if (!mergedGeometry) return;
+
+  // Center and scale the geometry
+  mergedGeometry.computeBoundingBox();
+  const box = mergedGeometry.boundingBox;
+  const center = new THREE.Vector3();
+  box.getCenter(center);
+  mergedGeometry.translate(-center.x, -center.y, -center.z);
+
+  const size = new THREE.Vector3();
+  box.getSize(size);
+  const maxDim = Math.max(size.x, size.y, size.z);
+  const scale = 2.0 / maxDim;
+  mergedGeometry.scale(scale, scale, scale);
+
+  // Sample surface
+  const { points, normals } = sampleSurfacePoints(mergedGeometry, PARTICLE_COUNT);
+
+  // Build BufferGeometry for points
+  const positions = new Float32Array(PARTICLE_COUNT * 3);
+  const basePositions = new Float32Array(PARTICLE_COUNT * 3);
+  const sizes = new Float32Array(PARTICLE_COUNT);
+  const phases = new Float32Array(PARTICLE_COUNT); // random phase offset
+  const normalData = new Float32Array(PARTICLE_COUNT * 3);
+
+  for (let i = 0; i < PARTICLE_COUNT; i++) {
+    const p = points[i];
+    const n = normals[i];
+    positions[i * 3] = p.x;
+    positions[i * 3 + 1] = p.y;
+    positions[i * 3 + 2] = p.z;
+
+    basePositions[i * 3] = p.x;
+    basePositions[i * 3 + 1] = p.y;
+    basePositions[i * 3 + 2] = p.z;
+
+    normalData[i * 3] = n.x;
+    normalData[i * 3 + 1] = n.y;
+    normalData[i * 3 + 2] = n.z;
+
+    sizes[i] = MIN_SIZE + Math.random() * (MAX_SIZE - MIN_SIZE);
+    phases[i] = Math.random() * Math.PI * 2;
+  }
+
+  const particleGeo = new THREE.BufferGeometry();
+  particleGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  particleGeo.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+
+  // Custom shader material for round, opaque, varying-size particles
+  const particleMat = new THREE.ShaderMaterial({
+    uniforms: {
+      uColor: { value: PARTICLE_COLOR },
+      uTexture: { value: createParticleTexture() },
+      uPixelRatio: { value: renderer.getPixelRatio() },
+    },
+    vertexShader: /* glsl */ `
+      attribute float aSize;
+      uniform float uPixelRatio;
+      varying float vAlpha;
+
+      void main() {
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_Position = projectionMatrix * mvPosition;
+        gl_PointSize = aSize * uPixelRatio * (300.0 / -mvPosition.z);
+        vAlpha = 1.0;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform vec3 uColor;
+      uniform sampler2D uTexture;
+      varying float vAlpha;
+
+      void main() {
+        vec4 tex = texture2D(uTexture, gl_PointCoord);
+        if (tex.a < 0.1) discard;
+        gl_FragColor = vec4(uColor, tex.a);
+      }
+    `,
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.NormalBlending,
+  });
+
+  const particleSystem = new THREE.Points(particleGeo, particleMat);
+  scene.add(particleSystem);
+
+  // ──────────── Animation ────────────
+  const clock = new THREE.Clock();
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const t = clock.getElapsedTime();
+
+    const posAttr = particleGeo.attributes.position;
+
+    for (let i = 0; i < PARTICLE_COUNT; i++) {
+      const bx = basePositions[i * 3];
+      const by = basePositions[i * 3 + 1];
+      const bz = basePositions[i * 3 + 2];
+
+      const nx = normalData[i * 3];
+      const ny = normalData[i * 3 + 1];
+      const nz = normalData[i * 3 + 2];
+
+      const phase = phases[i];
+      const speed = NOISE_SPEED;
+
+      // Tangent-based organic movement on surface
+      const n = noise3D(bx * 3.0, by * 3.0, bz * 3.0, t * speed + phase);
+
+      // Project noise onto tangent plane (remove normal component)
+      const dot = n.x * nx + n.y * ny + n.z * nz;
+      const tx = (n.x - dot * nx) * NOISE_AMPLITUDE;
+      const ty = (n.y - dot * ny) * NOISE_AMPLITUDE;
+      const tz = (n.z - dot * nz) * NOISE_AMPLITUDE;
+
+      // Small breathing along normal
+      const breathe = Math.sin(t * 0.5 + phase) * NOISE_AMPLITUDE * 0.3;
+
+      posAttr.setXYZ(
+        i,
+        bx + tx + nx * breathe,
+        by + ty + ny * breathe,
+        bz + tz + nz * breathe,
+      );
+    }
+
+    posAttr.needsUpdate = true;
+
+    controls.update();
+    renderer.render(scene, camera);
+  }
+
+  animate();
+});
+
+// ──────────── Resize ────────────
+window.addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+  </script>
+</body>
+</html>
